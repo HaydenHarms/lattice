@@ -40,7 +40,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOD_NOREPEAT, MOD_SHIFT, VK_LBUTTON, VK_SHIFT,
 };
 use windows::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
+    SHAppBarMessage, Shell_NotifyIconW, ABM_NEW, ABM_REMOVE, ABN_FULLSCREENAPP, APPBARDATA, NIF_ICON, NIF_MESSAGE,
+    NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging as wm;
 
@@ -1698,6 +1699,24 @@ unsafe extern "system" fn keys_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
             keys_keep_up(h);
             LRESULT(0)
         }
+        // The shell says an app went full screen on this display, or left
+        // it: the taskbar steps aside then, and so does the panel.
+        WM_KEYS_APPBAR => {
+            if wp.0 as u32 == ABN_FULLSCREENAPP {
+                SHELL_FULL.store(lp.0 != 0, Ordering::Relaxed);
+                keys_keep_up(h);
+            }
+            LRESULT(0)
+        }
+        wm::WM_DESTROY => {
+            keys_appbar(h, ABM_REMOVE);
+            LRESULT(0)
+        }
+        // Explorer restarted: tell the new one about the panel again.
+        m if m != 0 && m == taskbar_created() => {
+            keys_appbar(h, ABM_NEW);
+            wm::DefWindowProcW(h, msg, wp, lp)
+        }
         _ => wm::DefWindowProcW(h, msg, wp, lp),
     }
 }
@@ -1742,6 +1761,7 @@ pub fn create_keys(rows: Vec<(String, String)>, area: Rect, scale: f32) -> Hwnd 
             std::mem::size_of_val(&round) as u32,
         );
         let _ = wm::SetTimer(h, KEYS_TIMER, 1000, None);
+        keys_appbar(h, ABM_NEW);
         h.0 as isize
     };
     {
@@ -1802,15 +1822,46 @@ fn place_keys(h: Hwnd) {
             r.y,
             r.w,
             r.h,
-            wm::SWP_SHOWWINDOW | wm::SWP_NOACTIVATE,
+            if SHELL_FULL.load(Ordering::Relaxed) { wm::SWP_NOACTIVATE } else { wm::SWP_SHOWWINDOW | wm::SWP_NOACTIVATE },
         );
         let _ = InvalidateRect(hwnd(h), None, false);
     }
 }
 
+/// The shell's notifications for the panel, as an appbar.
+const WM_KEYS_APPBAR: u32 = wm::WM_APP + 6;
+/// Whether the shell last said an app is full screen.
+static SHELL_FULL: AtomicBool = AtomicBool::new(false);
+
+/// Sign the panel up as an appbar (`ABM_NEW`), or off (`ABM_REMOVE`). It
+/// never asks for space, so the work area stays as it is; it only hears
+/// `ABN_FULLSCREENAPP`, the same news the taskbar goes by.
+unsafe fn keys_appbar(h: HWND, what: u32) {
+    let mut d = APPBARDATA {
+        cbSize: std::mem::size_of::<APPBARDATA>() as u32,
+        hWnd: h,
+        uCallbackMessage: WM_KEYS_APPBAR,
+        ..Default::default()
+    };
+    if what == ABM_NEW {
+        SHELL_FULL.store(false, Ordering::Relaxed);
+    }
+    SHAppBarMessage(what, &mut d);
+}
+
+/// The message Explorer sends every top-level window when it starts.
+fn taskbar_created() -> u32 {
+    static ID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *ID.get_or_init(|| unsafe { wm::RegisterWindowMessageW(w!("TaskbarCreated")) })
+}
+
 /// Back on top of other always-on-top windows, unless something is
 /// full screen, when it hides.
 unsafe fn keys_keep_up(h: HWND) {
+    if SHELL_FULL.load(Ordering::Relaxed) {
+        let _ = wm::ShowWindow(h, wm::SW_HIDE);
+        return;
+    }
     let fg = wm::GetForegroundWindow();
     let full = !fg.0.is_null() && fg != h && {
         let mut class = [0u16; 32];
